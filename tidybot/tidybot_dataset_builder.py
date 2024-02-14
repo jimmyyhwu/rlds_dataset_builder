@@ -2,9 +2,36 @@ from typing import Iterator, Tuple, Any
 
 import glob
 import numpy as np
+import pandas as pd
 import tensorflow as tf
 import tensorflow_datasets as tfds
 import tensorflow_hub as hub
+import yaml
+from PIL import Image
+
+import benchmark
+
+
+def load_scenario(scenario_name):
+    with open(f'scenarios/{scenario_name}.yml', 'r', encoding='utf8') as f:
+        scenario_dict = yaml.safe_load(f)
+    scenario = benchmark.Scenario(
+        room=None,
+        receptacles=[r for r, info in scenario_dict['receptacles'].items() if 'primitive_names' in info],
+        seen_objects=scenario_dict['seen_objects'],
+        seen_placements=scenario_dict['seen_placements'],
+        unseen_objects=scenario_dict['unseen_objects'],
+        unseen_placements=scenario_dict['unseen_placements'],
+        annotator_notes=scenario_dict['annotator_notes'],
+        tags=None)
+
+    return scenario
+
+
+def get_language_instruction(annotator_notes):
+    parts = annotator_notes.split('. ')
+    assert len(parts) == 2
+    return f'{parts[0]}.'
 
 
 class Tidybot(tfds.core.GeneratorBasedBuilder):
@@ -26,29 +53,21 @@ class Tidybot(tfds.core.GeneratorBasedBuilder):
                 'steps': tfds.features.Dataset({
                     'observation': tfds.features.FeaturesDict({
                         'image': tfds.features.Image(
-                            shape=(64, 64, 3),
+                            shape=(360, 640, 3),
                             dtype=np.uint8,
                             encoding_format='png',
-                            doc='Main camera RGB observation.',
+                            doc='Egocentric camera RGB image of current object.',
                         ),
-                        'wrist_image': tfds.features.Image(
-                            shape=(64, 64, 3),
-                            dtype=np.uint8,
-                            encoding_format='png',
-                            doc='Wrist camera RGB observation.',
+                        'object': tfds.features.Text(
+                            doc='Name of current object.',
                         ),
-                        'state': tfds.features.Tensor(
-                            shape=(10,),
-                            dtype=np.float32,
-                            doc='Robot state, consists of [7x robot joint angles, '
-                                '2x gripper position, 1x door opening angle].',
-                        )
+                        'receptacles': tfds.features.Sequence(
+                            feature=tfds.features.Text(),
+                            doc='Names of available receptacles.',
+                        ),
                     }),
-                    'action': tfds.features.Tensor(
-                        shape=(10,),
-                        dtype=np.float32,
-                        doc='Robot action, consists of [7x joint velocities, '
-                            '2x gripper velocities, 1x terminate episode].',
+                    'action': tfds.features.Text(
+                        doc='Name of selected receptacle.'
                     ),
                     'discount': tfds.features.Scalar(
                         dtype=np.float32,
@@ -90,36 +109,37 @@ class Tidybot(tfds.core.GeneratorBasedBuilder):
     def _split_generators(self, dl_manager: tfds.download.DownloadManager):
         """Define data splits."""
         return {
-            'train': self._generate_examples(path='data/train/episode_*.npy'),
-            'val': self._generate_examples(path='data/val/episode_*.npy'),
+            'train': self._generate_examples(),
         }
 
-    def _generate_examples(self, path) -> Iterator[Tuple[str, Any]]:
+    def _generate_examples(self) -> Iterator[Tuple[str, Any]]:
         """Generator of examples for each split."""
 
-        def _parse_example(episode_path):
-            # load raw data --> this should change for your dataset
-            data = np.load(episode_path, allow_pickle=True)     # this is a list of dicts in our case
+        def _parse_example(episode_path, data, scenario_name):
+            # load raw data
+            scenario = load_scenario(scenario_name)
+            placements = {o: r for o, r in scenario.unseen_placements}
+            language_instruction = get_language_instruction(scenario.annotator_notes)
 
             # assemble episode --> here we're assuming demos so we set reward to 1 at the end
             episode = []
             for i, step in enumerate(data):
                 # compute Kona language embedding
-                language_embedding = self._embed([step['language_instruction']])[0].numpy()
+                language_embedding = self._embed([language_instruction])[0].numpy()
 
                 episode.append({
                     'observation': {
-                        'image': step['image'],
-                        'wrist_image': step['wrist_image'],
-                        'state': step['state'],
+                        'image': np.array(Image.open(step['image_path'])),
+                        'object': step['object'],
+                        'receptacles': scenario.receptacles,
                     },
-                    'action': step['action'],
+                    'action': placements[step['object']],
                     'discount': 1.0,
                     'reward': float(i == (len(data) - 1)),
                     'is_first': i == 0,
                     'is_last': i == (len(data) - 1),
                     'is_terminal': i == (len(data) - 1),
-                    'language_instruction': step['language_instruction'],
+                    'language_instruction': language_instruction,
                     'language_embedding': language_embedding,
                 })
 
@@ -131,20 +151,16 @@ class Tidybot(tfds.core.GeneratorBasedBuilder):
                 }
             }
 
-            # if you want to skip an example for whatever reason, simply return None
             return episode_path, sample
 
         # create list of all examples
-        episode_paths = glob.glob(path)
+        df = pd.read_csv('annotations.csv')
+        df['episode_path'] = df.apply(lambda row: f'scenario-{row["Scenario"]:02}-run-{row["Run"]:02}', axis=1)
+        df['image_path'] = df.apply(lambda row: f'images/{row["Scenario"]:02}-{row["Run"]:02}/{row["Image"]}', axis=1)
+        df = df.rename(columns={'Object': 'object'})
+        episode_to_data = df.groupby('episode_path').apply(lambda x: x[['image_path', 'object']].to_dict('records')).to_dict()
+        episode_to_scenario_name = {episode_path: f'scenario-{row["Scenario"]:02}' for episode_path, row in df.groupby('episode_path').first().iterrows()}
 
         # for smallish datasets, use single-thread parsing
-        for sample in episode_paths:
-            yield _parse_example(sample)
-
-        # for large datasets use beam to parallelize data parsing (this will have initialization overhead)
-        # beam = tfds.core.lazy_imports.apache_beam
-        # return (
-        #         beam.Create(episode_paths)
-        #         | beam.Map(_parse_example)
-        # )
-
+        for episode_path in sorted(episode_to_data):
+            yield _parse_example(episode_path, episode_to_data[episode_path], episode_to_scenario_name[episode_path])

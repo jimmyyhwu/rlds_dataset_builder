@@ -37,6 +37,9 @@ for i, episode in enumerate(ds.take(5)):
     images = []
     for step in episode['steps']:
         images.append(step['observation']['image'].numpy())
+        print('Observation:', step['observation']['object'], step['observation']['receptacles'])
+        print('Action:', step['action'])
+        print()
     image_strip = np.concatenate(images[::4], axis=1)
     caption = step['language_instruction'].numpy().decode() + ' (temp. downsampled 4x)'
 
@@ -45,18 +48,18 @@ for i, episode in enumerate(ds.take(5)):
     else:
         plt.figure()
         plt.imshow(image_strip)
-        plt.title(caption)
+        plt.title(caption, fontsize=8)
 
 # visualize action and state statistics
-actions, states = [], []
-for episode in tqdm.tqdm(ds.take(500)):
-    for step in episode['steps']:
-        actions.append(step['action'].numpy())
-        states.append(step['observation']['state'].numpy())
-actions = np.array(actions)
-states = np.array(states)
-action_mean = actions.mean(0)
-state_mean = states.mean(0)
+# actions, states = [], []
+# for episode in tqdm.tqdm(ds.take(500)):
+#     for step in episode['steps']:
+#         actions.append(step['action'].numpy())
+#         states.append(step['observation']['state'].numpy())
+# actions = np.array(actions)
+# states = np.array(states)
+# action_mean = actions.mean(0)
+# state_mean = states.mean(0)
 
 def vis_stats(vector, vector_mean, tag):
     assert len(vector.shape) == 2
@@ -73,8 +76,8 @@ def vis_stats(vector, vector_mean, tag):
     if render_wandb:
         wandb.log({tag: wandb.Image(fig)})
 
-vis_stats(actions, action_mean, 'action_stats')
-vis_stats(states, state_mean, 'state_stats')
+# vis_stats(actions, action_mean, 'action_stats')
+# vis_stats(states, state_mean, 'state_stats')
 
 if not render_wandb:
     plt.show()
